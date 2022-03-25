@@ -11,7 +11,7 @@ Input             | Default      | Description
 access_key_id     | **REQUIRED** | An AWS Access Key ID
 secret_access_key | **REQUIRED** | An AWS Secret Access Key
 ecr_uri           | **REQUIRED** | The URI of the ECR repository to push to
-build_only        | `false`       | Will skip pushing to ECR
+build_only        | `false`      | Will skip pushing to ECR
 env_file          | `""`         | File containing environment variables required for app to run and pass healthcheck
 healthcheck       | `/health`    | The path to a healthcheck that will be pulsed and requires passing before pushing to ECR
 port              | `3000`       | The port the server listens on
