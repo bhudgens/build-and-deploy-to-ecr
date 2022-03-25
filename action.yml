@@ -1,0 +1,221 @@
+name: Build and Deploy to ECR
+description: Builds an image from a dockerfile, and pushes it up to ECR
+inputs:
+  access_key_id:
+    description: AWS Access Key ID
+    required: true
+  build_only:
+    description: Whether to push the image to ECR after building it
+    required: false
+    default: "false"
+  dockerfile:
+    description: Custom Dockerfile name
+    required: false
+    default: Dockerfile
+  ecr_uri:
+    description: The URI for the ECR repository
+    required: true
+  env_file:
+    default: ""
+    description: File containing environment variables required for app to run and pass healthcheck
+    required: false
+  healthcheck:
+    description: healthcheck path that the application responds on
+    required: false
+    default: /health
+  port:
+    description: Port the server listens on
+    required: false
+    default: "3000"
+  secret_access_key:
+    description: AWS Secret Access Key
+    required: true
+
+outputs:
+  container-path:
+    description: ECR path where image was pushed
+    value: ${{ steps.setup.outputs.container-path }}
+  github-sha:
+    description: current github commit sha that triggered the workflow
+    value: ${{ steps.setup.outputs.github-sha }}
+
+runs:
+  using: composite
+  steps:
+    # yamllint disable rule:line-length
+    - name: Check for required inputs
+      shell: bash
+      run: |
+        # Did we even input, bro?
+        test -z "${{inputs.ecr_uri}}" && echo '::error::The ecr_uri input is blank. ' && exit 2
+        test -z "${{inputs.access_key_id}}" && echo '::error::The access_key_id input is blank. This probably means that your secret is blank or does not exist.' && exit 2
+        test -z "${{inputs.secret_access_key}}" && echo '::error::The secret_access_key input is blank. This probably means that your secret is blank or does not exist.' && exit 2
+
+        # ensure the dockerfile exists and is readable
+        if [ -n '${{ inputs.dockerfile }}' ] && [ ! -r '${{ inputs.dockerfile }}' ]; then
+          echo '::error::`${{ inputs.dockerfile }} was not found. If your Dockerfile has a custom name, please specify it using the `dockerfile: Dockerfile.prod` param.'
+          exit 2
+        fi
+
+    - name: Setup environment variables
+      id: setup
+      shell: bash
+      run: |
+        branch=$(cut --fields 3 --delimiter '/' <<< '${{ github.ref }}')
+        ecr_repository=$(tr '[:upper:]' '[:lower:]' <<< "github/${{ github.repository }}/$branch")
+        container_base=$(tr '[:upper:]' '[:lower:]' <<< "${{ inputs.ecr_uri }}/$ecr_repository")
+
+        echo CONTAINER_IMAGE_LATEST=$container_base:${prefix}latest >> $GITHUB_ENV
+        echo CONTAINER_IMAGE_SHA=$container_base:${prefix}${{ github.sha }} >> $GITHUB_ENV
+        echo ECR_REPOSITORY=$ecr_repository >> $GITHUB_ENV
+
+        if [ -n '${{ inputs.dockerfile }}' ] && [ '${{ inputs.dockerfile }}' != 'Dockerfile' ]; then
+          echo CUSTOM_DOCKERFILE='-f ${{ inputs.dockerfile }}' >> $GITHUB_ENV
+        fi
+
+        if [ -n '${{ inputs.env_file }}' ]; then
+          echo ENV_FILE='--env-file ${{ inputs.env_file }}' >> $GITHUB_ENV
+        fi
+
+        echo "::set-output name=aws-region::$(cut --fields 4 --delimiter '.' <<< '${{ inputs.ecr_uri }}')"
+        echo "::set-output name=base-container-image::$container_base"
+        echo "::set-output name=container-path::$(cut --fields 2- --delimiter '/' <<< "$container_base")"
+        echo '::set-output name=github-sha::${{ github.sha }}'
+
+    - name: Ensure ECR Repository Exists
+      shell: bash
+      id: assert-ecr-repo
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.secret_access_key }}
+        AWS_DEFAULT_REGION: ${{ steps.setup.outputs.aws-region }}
+      run: |
+        echo "Checking for ECR Repository: $ECR_REPOSITORY"
+        set +e
+        log1=/tmp/describe-error.log
+        ecr_repo=$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" 2>$log1)
+
+        if [ -f $log1 ]; then
+          cat $log1
+        fi
+
+        if [ -z "$ecr_repo" ]; then
+          log2=/tmp/create-error.log
+          echo "Creating ECR Repository: $ECR_REPOSITORY"
+          created=$(aws ecr create-repository --repository-name "$ECR_REPOSITORY" --tags "Key=ManagedBy,Value=GitHub" 2>$log2)
+
+          if [ -f $log2 ]; then
+            cat $log2
+          fi
+
+          if [ -z "$created" ]; then
+            echo "Could not create ECR Repository: $ECR_REPOSITORY"
+            exit 1
+          fi
+
+          echo "Setting Policy for ECR Repo: $ECR_REPOSITORY"
+          policy=$(cat ${{ github.action_path }}/ecr-policy.json)
+          log3=/tmp/policy-error.log
+          policy_set=$(aws ecr set-repository-policy --repository-name "$ECR_REPOSITORY" --policy-text "$policy" 2>$log3)
+
+          if [ -f $log3 ]; then
+            cat $log3
+          fi
+
+          if [ -z "$policy_set" ]; then
+            echo "Could not set ECR policy for $ECR_REPOSITORY"
+            exit 1
+          fi
+        fi
+        set -e
+
+    - name: Get ECR login password
+      shell: bash
+      id: get-login-password
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.secret_access_key }}
+      run: |
+        login_password="$(aws ecr get-login-password --region '${{ steps.setup.outputs.aws-region }}')"
+        echo "::add-mask::$login_password"
+
+        if [ -z "$login_password" ]; then
+          echo '::error::Unable to obtain ECR password'
+          exit 4
+        fi
+
+        echo "::set-output name=password::$login_password"
+
+    - name: Docker login
+      shell: bash
+      run: >
+        docker login
+        --username AWS
+        --password '${{ steps.get-login-password.outputs.password }}'
+        ${{ inputs.ecr_uri }}
+
+    - name: Docker build
+      shell: bash
+      env:
+        # equivalent to --progress=plain
+        BUILDKIT_PROGRESS: plain
+        # https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds
+        DOCKER_BUILDKIT: ${{ steps.setup.outputs.docker-buildkit }}
+      run: >
+        docker build
+        --tag $CONTAINER_IMAGE_SHA
+        --tag $CONTAINER_IMAGE_LATEST
+        $CUSTOM_DOCKERFILE
+        .
+
+    - name: Check health
+      shell: bash
+      run: |
+        if [ -n '${{ inputs.healthcheck }}' ]; then
+          # Healthcheck the built container
+          docker run --detach \
+            --net host \
+            --publish ${{inputs.port}}:${{inputs.port}} \
+            $ENV_FILE \
+            --env "HEALTHCHECK=${{inputs.healthcheck}}" \
+            --env "PORT=${{inputs.port}}" \
+            --name test-container $CONTAINER_IMAGE_SHA
+
+          ATTEMPT_COUNT=0
+          MAX_ATTEMPTS=5
+
+          HEALTHCHECK="http://localhost:${{inputs.port}}${{inputs.healthcheck}}"
+
+          until $(curl --output /dev/null --silent --head --fail --max-time 5 "${HEALTHCHECK}"); do
+            if [ "$((++ATTEMPT_COUNT))" -gt "${MAX_ATTEMPTS}" ];then
+              echo "::error::Container did not pass healthcheck at $HEALTHCHECK after $MAX_ATTEMPTS attempts"
+              echo "::warning::If your container does not require a healthcheck (most jobs don't), then set healthcheck to a blank string."
+              echo "::group::docker logs"
+              docker logs test-container
+              echo "::endgroup::"
+              echo $(docker stop test-container) stopped.
+              exit 1
+            fi
+
+            sleep 5
+            echo "Tested healthcheck ${HEALTHCHECK} : Attempt ${ATTEMPT_COUNT} of ${MAX_ATTEMPTS}"
+          done
+
+          echo "Healthcheck passed!"
+          echo $(docker stop test-container) stopped.
+        else
+          echo '::warning::No healthcheck specified'
+        fi
+    - name: Push to ECR
+      shell: bash
+      run: |
+        if [ '${{ inputs.build_only }}' = 'false' ]; then
+          docker push ${{ steps.setup.outputs.base-container-image }} --all-tags
+        fi
+
+    - name: Log out of all registries
+      shell: bash
+      run: |
+        for host in ${{ steps.registries.outputs.registry-hosts }} ; do
+          docker logout $host
+        done
